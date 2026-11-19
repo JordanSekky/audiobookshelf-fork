@@ -39,6 +39,10 @@ class Stream extends EventEmitter {
     this.isTranscodeComplete = false
     this.segmentsCreated = new Set()
     this.furthestSegmentCreated = 0
+    /** @type {import('fs').FSWatcher|null} */
+    this.watcher = null
+    this.lastProgressEmit = 0
+    this.isCheckingFiles = false
   }
 
   /**
@@ -150,85 +154,135 @@ class Stream extends EventEmitter {
     return this.clientPlaylistUri
   }
 
-  async checkFiles() {
+  /**
+   * @param {string} filename
+   * @returns {number|null} segment number, or null if not a finished segment
+   */
+  parseSegmentFilename(filename) {
+    const match = /^output-(\d+)\.ts$/.exec(filename || '')
+    return match ? Number(match[1]) : null
+  }
+
+  startWatcher() {
+    if (this.watcher) return
     try {
-      var files = await fs.readdir(this.streamPath)
+      this.watcher = fs.watch(this.streamPath, (eventType, filename) => {
+        // filename is not provided on every platform
+        if (!filename) return this.checkFiles()
+        const segNum = this.parseSegmentFilename(filename)
+        if (segNum === null) return
+        this.segmentsCreated.add(segNum)
+        this.onSegmentsUpdated()
+      })
+      this.watcher.on('error', (error) => {
+        Logger.warn(`[STREAM] ${this.id} segment watcher failed, polling instead`, error)
+        this.stopWatcher()
+        if (this.ffmpeg) this.startPolling()
+      })
+    } catch (error) {
+      Logger.warn(`[STREAM] ${this.id} cannot watch segments, polling instead`, error)
+      this.watcher = null
+    }
+  }
+
+  stopWatcher() {
+    if (this.watcher) this.watcher.close()
+    this.watcher = null
+  }
+
+  /**
+   * Fallback for missed watcher events
+   */
+  async checkFiles() {
+    if (this.isCheckingFiles) return
+    this.isCheckingFiles = true
+    try {
+      const files = await fs.readdir(this.streamPath)
       files.forEach((file) => {
-        var extname = Path.extname(file)
-        if (extname === '.ts') {
-          var basename = Path.basename(file, extname)
-          var num_part = basename.split('-')[1]
-          var part_num = Number(num_part)
-          this.segmentsCreated.add(part_num)
-        }
+        const segNum = this.parseSegmentFilename(file)
+        if (segNum !== null) this.segmentsCreated.add(segNum)
       })
 
       if (!this.segmentsCreated.size) {
         Logger.warn('No Segments')
         return
       }
-
-      if (this.segmentsCreated.size > 6 && !this.isClientInitialized) {
-        this.isClientInitialized = true
-        Logger.info(`[STREAM] ${this.id} notifying client that stream is ready`)
-        this.clientEmit('stream_open', this.toJSON())
-      }
-
-      var chunks = []
-      var current_chunk = []
-      var last_seg_in_chunk = -1
-
-      var segments = Array.from(this.segmentsCreated).sort((a, b) => a - b)
-      var lastSegment = segments[segments.length - 1]
-      if (lastSegment > this.furthestSegmentCreated) {
-        this.furthestSegmentCreated = lastSegment
-      }
-
-      segments.forEach((seg) => {
-        if (!current_chunk.length || last_seg_in_chunk + 1 === seg) {
-          last_seg_in_chunk = seg
-          current_chunk.push(seg)
-        } else {
-          if (current_chunk.length === 1) chunks.push(current_chunk[0])
-          else chunks.push(`${current_chunk[0]}-${current_chunk[current_chunk.length - 1]}`)
-          last_seg_in_chunk = seg
-          current_chunk = [seg]
-        }
-      })
-      if (current_chunk.length) {
-        if (current_chunk.length === 1) chunks.push(current_chunk[0])
-        else chunks.push(`${current_chunk[0]}-${current_chunk[current_chunk.length - 1]}`)
-      }
-
-      var perc = ((this.segmentsCreated.size * 100) / this.numSegments).toFixed(2) + '%'
-      Logger.info('[STREAM-CHECK] Check Files', this.segmentsCreated.size, 'of', this.numSegments, perc, `Furthest Segment: ${this.furthestSegmentCreated}`)
-      // Logger.debug('[STREAM-CHECK] Chunks', chunks.join(', '))
-
-      this.clientEmit('stream_progress', {
-        stream: this.id,
-        percent: perc,
-        chunks,
-        numSegments: this.numSegments
-      })
+      this.onSegmentsUpdated()
     } catch (error) {
       Logger.error('Failed checking files', error)
+    } finally {
+      this.isCheckingFiles = false
     }
+  }
+
+  onSegmentsUpdated() {
+    // End of the unbroken run from segmentStartNumber; stale segments from an earlier transcode don't count
+    let seg = Math.max(this.furthestSegmentCreated, this.segmentStartNumber - 1)
+    while (this.segmentsCreated.has(seg + 1)) seg++
+    if (seg >= this.segmentStartNumber && seg > this.furthestSegmentCreated) {
+      this.furthestSegmentCreated = seg
+    }
+
+    if (this.segmentsCreated.size > 6 && !this.isClientInitialized) {
+      this.isClientInitialized = true
+      Logger.info(`[STREAM] ${this.id} notifying client that stream is ready`)
+      this.clientEmit('stream_open', this.toJSON())
+    }
+
+    if (Date.now() - this.lastProgressEmit >= 2000) {
+      this.emitProgress()
+    }
+  }
+
+  emitProgress() {
+    this.lastProgressEmit = Date.now()
+
+    var chunks = []
+    var current_chunk = []
+    var last_seg_in_chunk = -1
+
+    var segments = Array.from(this.segmentsCreated).sort((a, b) => a - b)
+
+    segments.forEach((seg) => {
+      if (!current_chunk.length || last_seg_in_chunk + 1 === seg) {
+        last_seg_in_chunk = seg
+        current_chunk.push(seg)
+      } else {
+        if (current_chunk.length === 1) chunks.push(current_chunk[0])
+        else chunks.push(`${current_chunk[0]}-${current_chunk[current_chunk.length - 1]}`)
+        last_seg_in_chunk = seg
+        current_chunk = [seg]
+      }
+    })
+    if (current_chunk.length) {
+      if (current_chunk.length === 1) chunks.push(current_chunk[0])
+      else chunks.push(`${current_chunk[0]}-${current_chunk[current_chunk.length - 1]}`)
+    }
+
+    var perc = ((this.segmentsCreated.size * 100) / this.numSegments).toFixed(2) + '%'
+    Logger.info('[STREAM-CHECK] Check Files', this.segmentsCreated.size, 'of', this.numSegments, perc, `Furthest Segment: ${this.furthestSegmentCreated}`)
+
+    this.clientEmit('stream_progress', {
+      stream: this.id,
+      percent: perc,
+      chunks,
+      numSegments: this.numSegments
+    })
   }
 
   startLoop() {
     this.clientEmit('stream_progress', { stream: this.id, chunks: [], numSegments: 0, percent: '0%' })
+    this.startPolling()
+  }
 
+  startPolling() {
     clearInterval(this.loop)
-    var intervalId = setInterval(() => {
-      if (!this.isTranscodeComplete) {
-        this.checkFiles()
-      } else {
-        Logger.info(`[Stream] ${this.mediaTitle} sending stream_ready`)
-        this.clientEmit('stream_ready')
-        clearInterval(intervalId)
-      }
+    let ticks = 0
+    // Fallback for missed watcher events: every 2s until the stream is open, then every 10s
+    this.loop = setInterval(() => {
+      if (this.watcher && this.isClientInitialized && ++ticks % 5 !== 0) return
+      this.checkFiles()
     }, 2000)
-    this.loop = intervalId
   }
 
   async start() {
@@ -283,7 +337,8 @@ class Stream extends EventEmitter {
     }
 
     this.ffmpeg.addOption(codecOptions)
-    const hlsOptions = ['-f hls', '-copyts', '-avoid_negative_ts make_non_negative', '-max_delay 5000000', '-max_muxing_queue_size 2048', `-hls_time 6`, `-hls_segment_type ${this.hlsSegmentType}`, `-start_number ${this.segmentStartNumber}`, '-hls_playlist_type vod', '-hls_list_size 0', '-hls_allow_cache 0']
+    // temp_file: segments are written as .tmp and renamed when complete
+    const hlsOptions = ['-f hls', '-copyts', '-avoid_negative_ts make_non_negative', '-max_delay 5000000', '-max_muxing_queue_size 2048', `-hls_time 6`, `-hls_segment_type ${this.hlsSegmentType}`, `-start_number ${this.segmentStartNumber}`, '-hls_playlist_type vod', '-hls_list_size 0', '-hls_allow_cache 0', '-hls_flags temp_file']
     this.ffmpeg.addOption(hlsOptions)
     if (this.hlsSegmentType === 'fmp4') {
       this.ffmpeg.addOption('-strict -2')
@@ -299,16 +354,10 @@ class Stream extends EventEmitter {
       Logger.info('[INFO] FFMPEG transcoding started with command: ' + command)
       Logger.info('')
       if (this.isResetting) {
-        // AAC encode is much slower
-        const clearIsResettingTime = this.transcodeForceAAC ? 3000 : 500
-        setTimeout(() => {
-          Logger.info('[STREAM] Clearing isResetting')
-          this.isResetting = false
-          this.startLoop()
-        }, clearIsResettingTime)
-      } else {
-        this.startLoop()
+        Logger.info('[STREAM] Clearing isResetting')
+        this.isResetting = false
       }
+      this.startLoop()
     })
 
     this.ffmpeg.on('stderr', (stdErrline) => {
@@ -323,6 +372,9 @@ class Stream extends EventEmitter {
         clearInterval(this.loop)
       } else {
         Logger.error('Ffmpeg Err', '"' + err.message + '"')
+        // ffmpeg has already exited. Clear the reference so reset() does not wait for it to close
+        this.ffmpeg = null
+        clearInterval(this.loop)
 
         // Temporary workaround for https://github.com/advplyr/audiobookshelf/issues/172 and https://github.com/advplyr/audiobookshelf/issues/2157
         const aacErrorMsg = 'ffmpeg exited with code 1'
@@ -350,13 +402,17 @@ class Stream extends EventEmitter {
       this.isTranscodeComplete = true
       this.ffmpeg = null
       clearInterval(this.loop)
+      Logger.info(`[Stream] ${this.mediaTitle} sending stream_ready`)
+      this.clientEmit('stream_ready')
     })
 
+    this.startWatcher()
     this.ffmpeg.run()
   }
 
   async close(errorMessage = null) {
     clearInterval(this.loop)
+    this.stopWatcher()
 
     Logger.info('Closing Stream', this.id)
     if (this.ffmpeg) {
@@ -385,13 +441,23 @@ class Stream extends EventEmitter {
     }
   }
 
+  /**
+   * Resolves when the current ffmpeg process exits, or false after 10s
+   */
   async waitCancelTranscode() {
-    for (let i = 0; i < 20; i++) {
-      if (!this.ffmpeg) return true
-      await new Promise((resolve) => setTimeout(resolve, 500))
-    }
-    Logger.error('[STREAM] Transcode never closed...')
-    return false
+    const ffmpeg = this.ffmpeg
+    if (!ffmpeg) return true
+    const exited = await new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), 10000)
+      const onExit = () => {
+        clearTimeout(timeout)
+        resolve(true)
+      }
+      ffmpeg.once('error', onExit)
+      ffmpeg.once('end', onExit)
+    })
+    if (!exited) Logger.error('[STREAM] Transcode never closed...')
+    return exited
   }
 
   async reset(time) {
@@ -402,8 +468,9 @@ class Stream extends EventEmitter {
     this.isResetting = true
 
     if (this.ffmpeg) {
+      const exited = this.waitCancelTranscode()
       this.cancelTranscode()
-      await this.waitCancelTranscode()
+      await exited
     }
 
     this.isTranscodeComplete = false
